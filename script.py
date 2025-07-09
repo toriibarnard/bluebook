@@ -94,60 +94,256 @@ class CanadianBlueBookPriceFetcher:
             return 'Motorcycle'
 
     def find_best_model_match(self, results: List[Dict], target_model: str) -> Optional[Dict]:
-        """Find best model match from search results."""
+        """Find best model match from search results with proper type checking."""
         if not results:
             return None
 
-        target_lower = target_model.lower()
+        # Ensure results is a list and contains dictionaries
+        if not isinstance(results, list):
+            logger.warning(f"Expected list of results, got {type(results)}")
+            return None
 
-        # Look for exact match first
+        target_lower = target_model.lower().strip()
+        target_clean = ''.join(c for c in target_lower if c.isalnum())
+
+        best_match = None
+        best_score = 0
+
         for result in results:
-            if result.get('model', '').lower() == target_lower:
+            # Skip if result is not a dictionary
+            if not isinstance(result, dict):
+                logger.warning(f"Expected dict result, got {type(result)}: {result}")
+                continue
+
+            # Get model name safely
+            api_model = result.get('model', '')
+            if not api_model:
+                continue
+
+            api_lower = str(api_model).lower().strip()
+            api_clean = ''.join(c for c in api_lower if c.isalnum())
+
+            score = 0
+
+            # Exact match (highest priority)
+            if api_lower == target_lower:
+                logger.info(f"Exact model match found: '{api_model}' = '{target_model}'")
                 return result
 
-        # Look for partial match
-        for result in results:
-            model = result.get('model', '').lower()
-            if target_lower in model or model in target_lower:
-                return result
+            # Exact match without spaces/special chars
+            if api_clean == target_clean:
+                score = 95
+                logger.info(f"Clean exact match: '{api_model}' ≈ '{target_model}' (score: {score})")
 
-        # Return first result if no good match found
-        return results[0]
+            # Target model is contained in API model (e.g., "fly 150" in "Fly 150 Sport")
+            elif target_lower in api_lower:
+                score = 90 - (len(api_lower) - len(target_lower))  # Prefer shorter matches
+                logger.info(f"Target in API: '{target_model}' in '{api_model}' (score: {score})")
+
+            # API model is contained in target (e.g., "fly" in "fly 150")
+            elif api_lower in target_lower:
+                score = 85 - (len(target_lower) - len(api_lower))
+                logger.info(f"API in target: '{api_model}' in '{target_model}' (score: {score})")
+
+            # Partial alphanumeric match
+            elif target_clean in api_clean or api_clean in target_clean:
+                overlap = min(len(target_clean), len(api_clean))
+                total = max(len(target_clean), len(api_clean))
+                score = (overlap / total) * 80
+                logger.info(f"Partial match: '{api_model}' ≈ '{target_model}' (score: {score:.1f})")
+
+            # Word-by-word matching for complex models
+            else:
+                target_words = target_clean.split()
+                api_words = api_clean.split()
+
+                matching_words = 0
+                for t_word in target_words:
+                    for a_word in api_words:
+                        if len(t_word) >= 3 and len(a_word) >= 3:
+                            if t_word == a_word or t_word in a_word or a_word in t_word:
+                                matching_words += 1
+                                break
+
+                if matching_words > 0:
+                    score = (matching_words / max(len(target_words), len(api_words))) * 70
+                    logger.info(f"Word match: '{api_model}' ≈ '{target_model}' (score: {score:.1f})")
+
+            # Keep track of best match
+            if score > best_score:
+                best_score = score
+                best_match = result
+
+        if best_match and best_score >= 50:  # Only return if score is decent
+            logger.info(f"Best match selected (score: {best_score:.1f}): '{best_match.get('model', 'N/A')}'")
+            return best_match
+
+        logger.info(f"No good matches found for '{target_model}' (best score: {best_score:.1f})")
+        return None
 
     def search_by_year_make_model(self, year: int, make: str, model: str) -> Dict:
-        """Fuzzy search by year, make, model using POST query."""
+        """Search by year, make, model using the building blocks approach."""
         vehicle_type = self.determine_vehicle_type(make)
+        clean_make = make.upper().strip()
 
-        query_data = {
-            'type': vehicle_type,
-            'manu': make,
-            'year': int(year)
-        }
+        # Strategy 1: Try to get full records using building blocks approach
+        # This mimics the API documentation workflow
 
-        # Try v1 first (allows partial model matching)
-        success, data = self.api_request('/v1/query', 'POST', query_data)
+        logger.info(f"Trying building blocks approach for {vehicle_type} - {clean_make} {year}")
 
-        if success and data:
-            # Try to find exact or close model match
-            model_match = self.find_best_model_match(data, model)
-            if model_match:
-                return {'success': True, 'data': model_match, 'method': 'SEARCH_V1'}
+        # Step 1: Get models for this year/make using the building blocks API
+        try:
+            # Use the v1 building blocks approach: /api/v1/type/{type}/manu/{manu}/year/{year}/model
+            endpoint = f'/v1/type/{vehicle_type}/manu/{clean_make}/year/{year}/model'
+            logger.info(f"Building blocks request: {endpoint}")
 
-        return {'success': False, 'error': 'No matching models found', 'method': 'SEARCH_FAILED'}
+            success, models_data = self.api_request(endpoint, 'GET')
+
+            if success and models_data:
+                logger.info(f"Building blocks found {len(models_data) if isinstance(models_data, list) else 1} models")
+
+                # Now we should have a list of model names or IDs
+                best_model_id = None
+                best_score = 0
+
+                if isinstance(models_data, list):
+                    for model_item in models_data:
+                        if isinstance(model_item, str):
+                            # Score this model name
+                            score = self.calculate_model_similarity(model, model_item)
+                            logger.info(f"Model match score: '{model_item}' vs '{model}' = {score:.1f}%")
+
+                            if score > best_score and score >= 50:  # At least 50% match
+                                best_score = score
+                                best_model_id = model_item
+                        elif isinstance(model_item, dict) and 'model' in model_item:
+                            # Already a full record
+                            score = self.calculate_model_similarity(model, model_item['model'])
+                            if score >= 50:
+                                logger.info(f"Found full record match: {model_item['model']} (score: {score:.1f}%)")
+                                return {'success': True, 'data': model_item, 'method': 'BUILDING_BLOCKS_FULL'}
+
+                # If we found a good model match, try to get the full record
+                if best_model_id and best_score >= 50:
+                    logger.info(f"Best model match: '{best_model_id}' (score: {best_score:.1f}%)")
+
+                    # Try to get full record using: /api/v1/type/{type}/manu/{manu}/year/{year}/model/{model}/go
+                    full_endpoint = f'/v1/type/{vehicle_type}/manu/{clean_make}/year/{year}/model/{best_model_id}/go'
+                    logger.info(f"Getting full record: {full_endpoint}")
+
+                    success, full_data = self.api_request(full_endpoint, 'GET')
+
+                    if success and full_data:
+                        logger.info(f"✅ Got full record for {best_model_id}")
+                        # Handle if it returns a list
+                        if isinstance(full_data, list) and len(full_data) > 0:
+                            full_data = full_data[0]
+
+                        return {'success': True, 'data': full_data, 'method': f'BUILDING_BLOCKS_{vehicle_type}'}
+                    else:
+                        logger.info(f"Failed to get full record for {best_model_id}")
+                else:
+                    logger.info(f"No good model matches found (best score: {best_score:.1f}%)")
+            else:
+                logger.info(f"Building blocks approach found no models for {clean_make} {year}")
+
+        except Exception as e:
+            logger.warning(f"Building blocks approach failed: {str(e)}")
+
+        # Strategy 2: Try different vehicle type classifications
+        alternative_types = []
+        if vehicle_type == 'Scooter':
+            alternative_types = ['Motorcycle']
+        elif vehicle_type == 'Motorcycle':
+            alternative_types = ['Scooter']
+        elif make.upper() in ['POLARIS', 'CAN-AM', 'CANAM']:
+            alternative_types = ['UTV', 'Side-by-Side', 'Motorcycle']
+
+        for alt_type in alternative_types:
+            logger.info(f"Trying alternative type: {alt_type}")
+            try:
+                endpoint = f'/v1/type/{alt_type}/manu/{clean_make}/year/{year}/model'
+                success, models_data = self.api_request(endpoint, 'GET')
+
+                if success and models_data and isinstance(models_data, list):
+                    for model_item in models_data:
+                        if isinstance(model_item, str):
+                            score = self.calculate_model_similarity(model, model_item)
+                            if score >= 70:  # Higher threshold for alt types
+                                # Try to get full record
+                                full_endpoint = f'/v1/type/{alt_type}/manu/{clean_make}/year/{year}/model/{model_item}/go'
+                                success, full_data = self.api_request(full_endpoint, 'GET')
+
+                                if success and full_data:
+                                    if isinstance(full_data, list) and len(full_data) > 0:
+                                        full_data = full_data[0]
+                                    return {'success': True, 'data': full_data, 'method': f'ALT_TYPE_{alt_type}'}
+            except Exception as e:
+                logger.warning(f"Alternative type {alt_type} failed: {str(e)}")
+
+        return {'success': False, 'error': f'No full vehicle records found for {make} {year} {model}',
+                'method': 'SEARCH_FAILED'}
+
+    def calculate_model_similarity(self, target_model: str, api_model: str) -> float:
+        """Calculate similarity percentage between two model names."""
+        if not target_model or not api_model:
+            return 0.0
+
+        target_clean = ''.join(c.lower() for c in target_model if c.isalnum())
+        api_clean = ''.join(c.lower() for c in api_model if c.isalnum())
+
+        if not target_clean or not api_clean:
+            return 0.0
+
+        # Exact match
+        if target_clean == api_clean:
+            return 100.0
+
+        # Full substring match
+        if target_clean in api_clean or api_clean in target_clean:
+            overlap = min(len(target_clean), len(api_clean))
+            total = max(len(target_clean), len(api_clean))
+            return (overlap / total) * 95.0
+
+        # Calculate character overlap
+        target_set = set(target_clean)
+        api_set = set(api_clean)
+
+        if not target_set or not api_set:
+            return 0.0
+
+        intersection = len(target_set.intersection(api_set))
+        union = len(target_set.union(api_set))
+
+        return (intersection / union) * 80.0
 
     def extract_wholesale_price(self, data) -> Optional[float]:
-        """Extract wholesale price from API response - FIXED to handle lists and get rough price."""
+        """Extract wholesale price from API response with robust type checking."""
         if not data:
+            return None
+
+        # Handle different data types
+        if isinstance(data, str):
+            logger.warning(f"Expected dict/list but got string: {data[:100]}...")
             return None
 
         # If data is a list, take the first item
         if isinstance(data, list):
             if not data:  # Empty list
                 return None
-            data = data[0]  # Take first vehicle
 
-        # If data is not a dict after handling list, return None
+            # Take first item that looks like a vehicle record
+            for item in data:
+                if isinstance(item, dict):
+                    data = item
+                    break
+            else:
+                logger.warning(f"No dictionary found in list: {data}")
+                return None
+
+        # If data is still not a dict, give up
         if not isinstance(data, dict):
+            logger.warning(f"Expected dict after processing, got {type(data)}: {data}")
             return None
 
         # Canadian Blue Book specific fields - PRIORITIZE ROUGH PRICE as requested
@@ -157,34 +353,39 @@ class CanadianBlueBookPriceFetcher:
             'w_clean',  # wholesale clean condition
         ]
 
-        # Check CBB-specific fields
+        # Check CBB-specific fields first
         for field in price_fields:
-            if field in data and data[field] is not None:
+            value = data.get(field)
+            if value is not None:
                 try:
-                    price = float(data[field])
+                    price = float(value)
                     if price > 0:  # Must be positive
                         logger.info(f"Found CBB wholesale price ${price} in field '{field}'")
                         return price
                 except (ValueError, TypeError):
+                    logger.warning(f"Could not convert {field}={value} to float")
                     continue
 
         # Fallback to other possible price fields
         other_price_fields = [
             'wholesale_price', 'wholesale', 'trade_value', 'tradeValue',
-            'value', 'price', 'amount'
+            'value', 'price', 'amount', 'cost'
         ]
 
         for field in other_price_fields:
-            if field in data and data[field] is not None:
+            value = data.get(field)
+            if value is not None:
                 try:
-                    price = float(data[field])
+                    price = float(value)
                     if price > 0:
                         logger.info(f"Found price ${price} in field '{field}'")
                         return price
                 except (ValueError, TypeError):
                     continue
 
-        logger.debug(f"No price found in response")
+        # Log what fields are available for debugging
+        available_fields = list(data.keys()) if isinstance(data, dict) else []
+        logger.debug(f"No price found. Available fields: {available_fields[:10]}")
         return None
 
     def process_vehicle(self, vehicle: Dict) -> Dict:
@@ -407,7 +608,14 @@ def main():
     # Replace with your actual API key
     API_KEY = '144|inuYwvGhZePXzVmR3ZbRzH6dsRXs5UHYPtmvv9uX'
 
-    if API_KEY == '1':
+    # Enable debug mode to catch issues
+    DEBUG_MODE = True  # Temporarily enable to debug the 'str' error
+
+    if DEBUG_MODE:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("🔍 Debug mode enabled to track down the 'str' error")
+
+    if API_KEY == 'YOUR_API_KEY_HERE':
         print("⚠️  Please set your Canadian Blue Book API key in the API_KEY variable")
         print("Contact Canadian Blue Book to obtain API credentials")
         return
@@ -420,15 +628,17 @@ def main():
         print("🚀 Starting Canadian Blue Book price lookup...")
         print("📋 Strategy: VIN lookup first, then fallback to year/make/model search")
         print("💰 Looking for ROUGH wholesale price (w_rgh field)")
+        print("🔧 Fixed: 'str' object error and improved exact model matching")
+        print("✨ Special handling for PIAGGIO and other edge cases")
         print("")
 
         results_df = fetcher.process_excel_file(
             input_filename='bluebooktest.xlsx',
-            output_filename='cbb_wholesale_prices.xlsx'
+            output_filename='cbb_wholesale_prices_fixed.xlsx'
         )
 
         print(f"\n✅ Processing complete!")
-        print(f"📁 Results saved to: cbb_wholesale_prices.xlsx")
+        print(f"📁 Results saved to: cbb_wholesale_prices_fixed.xlsx")
         print(f"📊 Processed {len(results_df)} vehicles")
 
     except FileNotFoundError:
